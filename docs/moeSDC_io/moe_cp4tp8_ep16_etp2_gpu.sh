@@ -116,7 +116,7 @@ GPT_MODEL_ARGS=(
     --group-query-attention
     --seq-length "$SEQ_LEN"
     --max-position-embeddings "$SEQ_LEN"
-    --swiglu
+    # --swiglu # moeSDC_io的md文档是用swiglu得到的数据，因此groupedMLP 权重第2维是32768
 )
 
 MOE_ARGS=(
