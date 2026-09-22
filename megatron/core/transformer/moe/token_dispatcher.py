@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
@@ -748,7 +749,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         """Executes fused un-permutation and communication using DeepEP kernels.
 
         This method performs the inverse AlltoAll communication operation to collect expert
-        outputs from their processing ranks and redistribute them back to the ranks that
+        outputs from their processing ranks and redistribute tokens back to the ranks that
         originally held the corresponding tokens. This completes the expert processing
         communication pattern and prepares tokens for final unpermutation.
 
@@ -851,6 +852,524 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
             if point == self.cuda_sync_point:
                 # Synchronize with the DtoH stream at self.cuda_sync_point.
+                self.d2h_event.synchronize()
+
+        return tokens_per_expert
+
+class _OrderedEtpGradReduction(torch.autograd.Function):
+    """Reduce ETP replica gradients locally after the combined-A2A backward."""
+
+    @staticmethod
+    def forward(ctx, input_, split_sizes, ep_size, tp_size, num_local_experts):
+        ctx.split_sizes = split_sizes
+        ctx.ep_size = ep_size
+        ctx.tp_size = tp_size
+        ctx.num_local_experts = num_local_experts
+        return input_
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_chunks = torch.split(grad_output, ctx.split_sizes, dim=0)
+        grad_input = torch.zeros_like(grad_output)
+
+        chunk_offsets = [0]
+        for split_size in ctx.split_sizes:
+            chunk_offsets.append(chunk_offsets[-1] + split_size)
+
+        for ep_rank in range(ctx.ep_size):
+            for local_expert in range(ctx.num_local_experts):
+                first_chunk_idx = (
+                    ep_rank * ctx.tp_size
+                ) * ctx.num_local_experts + local_expert
+                reduced_grad = grad_chunks[first_chunk_idx]
+                for tp_rank in range(1, ctx.tp_size):
+                    chunk_idx = (
+                        ep_rank * ctx.tp_size + tp_rank
+                    ) * ctx.num_local_experts + local_expert
+                    assert grad_chunks[chunk_idx].shape == reduced_grad.shape
+                    reduced_grad = reduced_grad + grad_chunks[chunk_idx]
+
+                grad_input.narrow(
+                    0,
+                    chunk_offsets[first_chunk_idx],
+                    ctx.split_sizes[first_chunk_idx],
+                ).copy_(reduced_grad)
+
+        return grad_input, None, None, None, None
+
+class SDCMoEAlltoAllTokenDispatcher(MoETokenDispatcher):
+    """
+    AlltoAll-based token dispatcher using combined EP x ETP A2A with ETP-replica
+    collapse after the combine A2A.
+
+    The workflow of this token dispatcher is:
+    (1) preprocess: calculate necessary metadata for communication and permute
+    (2) dispatch process: expand and permute tokens for all ETP shards
+    (3) token dispatch: A2A(EPxETP)
+    (4) dispatch postprocess: sort_chunk(if num_local_experts>1)
+    (5) combine preprocess: sort_chunk(if num_local_experts>1)
+    (6) token combine: A2A(EPxETP)
+    (7) combine postprocess: reduce ETP partial outputs and unpermute tokens
+    """
+
+    def __init__(
+        self,
+        num_local_experts: int,
+        local_expert_indices: List[int],
+        config: TransformerConfig,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+    ) -> None:
+        super().__init__(config=config, model_comm_pgs=model_comm_pgs)
+        self.num_local_experts = num_local_experts
+        assert config.num_moe_experts is not None
+        self.num_experts = config.num_moe_experts
+        assert self.num_local_experts > 0, "Expected at least one expert"
+        self.local_expert_indices = local_expert_indices
+        assert (
+            len(self.local_expert_indices) == self.num_local_experts
+        ), "Invalid local expert indices"
+        for i in range(len(self.local_expert_indices) - 1):
+            assert (
+                self.local_expert_indices[i] == self.local_expert_indices[i + 1] - 1
+            ), "local_expert_indices must be continuous"
+
+        # [ep_size * etp_size]. Represents the number of tokens sent by the current rank to
+        # each rank in the EP * ETP group.
+        self.input_splits = None
+        # [ep_size * etp_size]. Represents the number of tokens received by the current rank
+        # from each rank in the EP * ETP group.
+        self.output_splits = None
+        # [EP * ETP, L]，当前 rank 发往每个目标 rank、每个 local expert 的 token 数。
+        self.num_tokens_per_target_rank_local_expert = None
+        self.permute_idx_device = torch.device("cuda") if self.config.moe_permute_fusion else "cpu"
+        input_chunk_idxs = torch.arange(
+            self.num_experts * self.tp_size, device=self.permute_idx_device
+        )
+        # [num_local_experts, tp_size, ep_size]. Match the expert input order produced by
+        # A2A(EP) followed by AG(ETP).
+        self.sort_input_by_local_experts = input_chunk_idxs.reshape(
+            self.ep_size, self.tp_size, self.num_local_experts
+        ).permute(2, 1, 0).ravel()
+        # [ep_size, tp_size, num_local_experts]. Restore the A2A(EP * ETP) chunk order.
+        self.restore_output_by_local_experts = torch.argsort(self.sort_input_by_local_experts)
+
+        # Token drop and padding.
+        self.drop_and_pad = self.config.moe_pad_expert_input_to_capacity
+        if self.drop_and_pad:
+            assert self.config.moe_expert_capacity_factor is not None
+            self.moe_expert_capacity_factor = self.config.moe_expert_capacity_factor
+        self.capacity = None
+
+        self.cuda_sync_point = "no_sync"
+        self.cuda_sync_point_priority = {
+            "before_permutation_1": 0,
+            "before_ep_alltoall": 1,
+            "before_permutation_2": 2,
+            "before_finish": 3,
+            "no_sync": 4,
+        }
+        self.cuda_dtoh_point = "before_permutation_1"
+        self.cuda_dtoh_stream = torch.cuda.Stream()
+
+        self.shared_experts = None
+
+    def _expand_to_ep_etp_targets(self, tensor: torch.Tensor) -> torch.Tensor:
+        """将每个 token-expert 路由项复制到该 expert 的所有 ETP 分片。
+
+        将 [N, E] = [N, EP * L] 转换为 [N, E * ETP]：
+        [N, EP, L] -> [N, EP, 1, L] -> [N, EP, ETP, L] -> [N, E * ETP].
+        输出的第二维按 [EP rank, ETP rank, local expert] 的顺序组织。
+        """
+        num_tokens = tensor.shape[0]
+        return (
+            tensor.reshape(num_tokens, self.ep_size, 1, self.num_local_experts)
+            .expand(-1, -1, self.tp_size, -1)
+            .reshape(num_tokens, self.tp_size * self.num_experts)
+            .contiguous()
+        )
+
+    def _collapse_etp_partial_outputs(
+        self, permutated_local_input_tokens: torch.Tensor
+    ) -> torch.Tensor:
+        """合并同一 expert 的 ETP 部分输出，并恢复扩展前的 expert 顺序。
+
+        输入为反向 A2A 返回的 `[M_etp, H]`，其中 `M_etp` 是包含 ETP 副本的
+        token-expert 任务数。分块大小记录在 `[EP * ETP, L]` 的
+        `num_tokens_per_target_rank_local_expert` 中，展平顺序为
+        `[EP rank, ETP rank, local expert]`。
+
+        每个 local expert 的 token 数可能不同，因此这些分块在逻辑上是
+        `[EP, ETP, L, variable_tokens, H]` 的变长布局，不能直接 reshape。函数固定
+        `EP rank` 和 `local expert`，沿 ETP 维求和，再按 `[EP rank, local expert]`
+        拼接，输出 `[M_etp / ETP, H]`。Dropless 模式下该维度通常为 `[N * K, H]`。
+        """
+        if self.tp_size == 1:
+            return permutated_local_input_tokens
+
+        split_sizes = self.num_tokens_per_target_rank_local_expert.reshape(-1).tolist()
+        token_chunks = torch.split(permutated_local_input_tokens, split_sizes, dim=0)
+        output_dtype = permutated_local_input_tokens.dtype
+        reduce_dtype = self.probs.dtype
+
+        collapsed_tokens = []
+        for ep_rank in range(self.ep_size):
+            for local_expert in range(self.num_local_experts):
+                first_chunk_idx = (ep_rank * self.tp_size) * self.num_local_experts + local_expert
+                reduced = token_chunks[first_chunk_idx].to(reduce_dtype)
+                for tp_rank in range(1, self.tp_size):
+                    chunk_idx = (
+                        ep_rank * self.tp_size + tp_rank
+                    ) * self.num_local_experts + local_expert
+                    reduced = reduced + token_chunks[chunk_idx].to(reduce_dtype)
+                collapsed_tokens.append(reduced.to(output_dtype))
+
+        return torch.cat(collapsed_tokens, dim=0)
+
+    def _build_unpermute_mapping(self, routing_map: torch.Tensor, fused: bool) -> torch.Tensor:
+        """根据扩展前的路由关系，构建最终 unpermute 使用的索引。
+
+        输入 `routing_map` 为 `[N, E]`，转置后的 `expert_to_token` 为 `[E, N]`。
+        令 `M` 为其中 True 的数量，即 ETP 合并后的原始 token-expert 任务数；Dropless
+        模式下通常有 `M = N * K`。
+
+        非融合模式返回 `[M]` 的原始 token index，用于将 expert-major 的 `[M, H]`
+        scatter-add 回 token-major 的 `[N, H]`。融合模式返回 `[E, N]` 的位置 mapping，
+        被选中的位置记录其在 `[M, H]` 中的行号，未被选中的位置为 `-1`。
+        """
+        num_tokens = routing_map.shape[0]
+        expert_to_token = routing_map.bool().T.contiguous()
+        if fused:
+            positions = torch.cumsum(expert_to_token.reshape(-1), dim=0) - 1
+            return torch.where(expert_to_token, positions.reshape_as(expert_to_token), -1)
+
+        token_indices = torch.arange(num_tokens, device=routing_map.device).unsqueeze(0)
+        token_indices = token_indices.expand(routing_map.shape[1], -1)
+        return token_indices.masked_select(expert_to_token)
+
+    def preprocess(self, routing_map: torch.Tensor) -> torch.Tensor:
+        if self.drop_and_pad:
+            num_tokens = routing_map.size(0) * self.config.moe_router_topk
+            self.capacity = get_capacity(
+                num_tokens=num_tokens,
+                num_experts=self.num_experts,
+                capacity_factor=self.moe_expert_capacity_factor,
+            )
+            self.num_out_tokens = self.capacity * self.num_experts * self.tp_size
+            self.expanded_routing_map = self._expand_to_ep_etp_targets(routing_map)
+            self.num_tokens_per_target_rank_local_expert = torch.full(
+                (self.ep_size * self.tp_size, self.num_local_experts),
+                self.capacity,
+                dtype=torch.long,
+            )
+            num_tokens_per_local_expert = torch.full(
+                (self.num_local_experts,),
+                self.capacity * self.tp_size * self.ep_size,
+                dtype=torch.long,
+            )
+            self.num_global_tokens_per_local_expert = torch.full(
+                (self.num_experts * self.tp_size,),
+                self.capacity,
+                dtype=torch.long,
+                device=self.permute_idx_device,
+            )
+            return num_tokens_per_local_expert
+
+        num_local_tokens_per_expert = routing_map.sum(dim=0).long()
+
+        if (
+            self.config.moe_expert_capacity_factor is not None
+            or self.config.moe_router_padding_for_fp8
+        ):
+            self.num_out_tokens = num_local_tokens_per_expert.sum() * self.tp_size
+            self._maybe_update_cuda_sync_point("before_permutation_1")
+        else:
+            self.num_out_tokens = routing_map.size(0) * self.config.moe_router_topk * self.tp_size
+
+        if self.ep_size > 1 or self.tp_size > 1:
+            self.expanded_routing_map = self._expand_to_ep_etp_targets(routing_map)
+            self.num_tokens_per_target_rank_local_expert = (
+                self.expanded_routing_map.sum(dim=0)
+                .reshape(self.ep_size * self.tp_size, self.num_local_experts)
+                .long()
+            )
+            self.input_splits = self.num_tokens_per_target_rank_local_expert.sum(dim=1)
+            # 内网用moe_a2a_communicate(会有padding)时，num_global_tokens_per_local_expert可以直接通过all_to_all通信得到
+            # self.tp_ep_group 就是内网的self.ep_etp_group
+            num_global_tokens_per_local_expert = all_to_all(
+                self.tp_ep_group,
+                self.num_tokens_per_target_rank_local_expert,
+            )
+            self.output_splits = num_global_tokens_per_local_expert.sum(dim=1)
+            num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=0)
+
+            self._maybe_update_cuda_sync_point("before_ep_alltoall")
+        else:
+            self.expanded_routing_map = routing_map
+            self.num_tokens_per_target_rank_local_expert = (
+                num_local_tokens_per_expert.reshape(1, self.num_local_experts)
+            )
+            num_global_tokens_per_local_expert = num_local_tokens_per_expert.reshape(
+                self.num_experts
+            )
+            num_tokens_per_local_expert = num_local_tokens_per_expert
+            self._maybe_update_cuda_sync_point("before_finish")
+
+        if self.num_local_experts > 1 or (self.ep_size > 1 and self.tp_size > 1):
+            self.num_global_tokens_per_local_expert = num_global_tokens_per_local_expert.view(
+                -1, self.num_local_experts
+            )
+            if not self.config.moe_permute_fusion:
+                self._maybe_update_cuda_sync_point("before_permutation_2")
+
+        assert (
+            self.cuda_sync_point_priority[self.cuda_dtoh_point]
+            <= self.cuda_sync_point_priority[self.cuda_sync_point]
+        ), "cuda_sync_point must be after cuda_dtoh_point."
+        return num_tokens_per_local_expert
+
+    def dispatch_preprocess(
+        self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
+    ):
+        self.hidden_shape = hidden_states.shape
+        self.probs = probs
+        self.routing_map = routing_map
+        assert probs.dim() == 2, "Expected 2D tensor for probs"
+        assert routing_map.dim() == 2, "Expected 2D tensor for token2expert mask"
+        assert routing_map.dtype == torch.bool, "Expected bool tensor for mask"
+        hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
+
+        if self.config.moe_router_padding_for_fp8:
+            pad_multiple = get_fp8_align_size(self.config.fp8_recipe)
+            if is_experimental_enabled() and self.config.moe_permute_fusion:
+                self.routing_map = fused_pad_routing_map(self.routing_map, pad_multiple)
+            else:
+                self.routing_map = pad_routing_map(self.routing_map, pad_multiple)
+        self.tokens_per_expert = self.preprocess(self.routing_map)
+
+        if self.shared_experts is not None:
+            self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape))
+
+        # Permutation 1: input to AlltoAll input
+        self.reversed_local_input_permutation_mapping = self._build_unpermute_mapping(
+            self.routing_map, self.config.moe_permute_fusion
+        )
+        expanded_probs = self._expand_to_ep_etp_targets(probs)
+        self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
+            "before_permutation_1", self.tokens_per_expert
+        )
+        self.hidden_shape_before_permute = hidden_states.shape
+        (
+            permutated_local_input_tokens,
+            permuted_probs,
+            _,
+        ) = permute(
+            hidden_states,
+            self.expanded_routing_map,
+            probs=expanded_probs,
+            num_out_tokens=self.num_out_tokens,
+            fused=self.config.moe_permute_fusion,
+            drop_and_pad=self.drop_and_pad,
+        )
+        return permutated_local_input_tokens, permuted_probs
+
+    def token_dispatch(self, permutated_local_input_tokens, permuted_probs):
+        self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
+            "before_ep_alltoall", self.tokens_per_expert
+        )
+        if (
+            os.environ.get("USE_ORDERED_ETP_BACKWARD", "0") == "1"
+            and self.tp_size > 1
+        ):
+            split_sizes = tuple(
+                self.num_tokens_per_target_rank_local_expert.reshape(-1).tolist()
+            )
+            permutated_local_input_tokens = _OrderedEtpGradReduction.apply(
+                permutated_local_input_tokens,
+                split_sizes,
+                self.ep_size,
+                self.tp_size,
+                self.num_local_experts,
+            )
+            permuted_probs = _OrderedEtpGradReduction.apply(
+                permuted_probs,
+                split_sizes,
+                self.ep_size,
+                self.tp_size,
+                self.num_local_experts,
+            )
+        # 内网用moe_paira2a_communicate(会有padding)时，num_global_tokens_per_local_expert可以直接通过all_to_all通信得到
+        # self.tp_ep_group 就是内网的self.ep_etp_group
+        global_input_tokens = all_to_all(
+            self.tp_ep_group, permutated_local_input_tokens, self.output_splits, self.input_splits
+        )
+        global_probs = all_to_all(
+            self.tp_ep_group, permuted_probs, self.output_splits, self.input_splits
+        )
+
+        return global_input_tokens, global_probs
+
+    def dispatch_postprocess(self, global_input_tokens, global_probs):
+        if self.shared_experts is not None:
+            self.shared_experts.linear_fc1_forward_and_act(global_input_tokens)
+
+        # Permutation 2: Sort tokens by local expert.
+        self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
+            "before_permutation_2", self.tokens_per_expert
+        )
+        if self.num_local_experts > 1 or (self.ep_size > 1 and self.tp_size > 1):
+            if self.drop_and_pad:
+                global_input_tokens = (
+                    global_input_tokens.view(
+                        self.ep_size,
+                        self.tp_size,
+                        self.num_local_experts,
+                        self.capacity,
+                        *global_input_tokens.size()[1:],
+                    )
+                    .transpose(0, 2)
+                    .contiguous()
+                    .flatten(start_dim=0, end_dim=3)
+                )
+                global_probs = (
+                    global_probs.view(
+                        self.ep_size,
+                        self.tp_size,
+                        self.num_local_experts,
+                        self.capacity,
+                        *global_probs.size()[1:],
+                    )
+                    .transpose(0, 2)
+                    .contiguous()
+                    .flatten(start_dim=0, end_dim=3)
+                )
+            else:
+                global_input_tokens, global_probs = sort_chunks_by_idxs(
+                    global_input_tokens,
+                    self.num_global_tokens_per_local_expert.ravel(),
+                    self.sort_input_by_local_experts,
+                    probs=global_probs,
+                    fused=self.config.moe_permute_fusion,
+                )
+
+        tokens_per_expert = self._maybe_dtoh_and_synchronize(
+            "before_finish", self.tokens_per_expert
+        )
+        self.tokens_per_expert = None
+        return global_input_tokens, tokens_per_expert, global_probs
+
+    def combine_preprocess(self, hidden_states):
+        if self.num_local_experts > 1 or (self.ep_size > 1 and self.tp_size > 1):
+            if self.drop_and_pad:
+                hidden_states = (
+                    hidden_states.view(
+                        self.num_local_experts,
+                        self.tp_size,
+                        self.ep_size,
+                        self.capacity,
+                        *hidden_states.size()[1:],
+                    )
+                    .transpose(0, 2)
+                    .contiguous()
+                    .flatten(start_dim=0, end_dim=3)
+                )
+            else:
+                sorted_split_sizes = (
+                    self.num_global_tokens_per_local_expert.reshape(
+                        self.ep_size, self.tp_size, self.num_local_experts
+                    )
+                    .permute(2, 1, 0)
+                    .reshape(-1)
+                )
+                hidden_states, _ = sort_chunks_by_idxs(
+                    hidden_states,
+                    sorted_split_sizes,
+                    self.restore_output_by_local_experts,
+                    fused=self.config.moe_permute_fusion,
+                )
+
+        return hidden_states
+
+    def token_combine(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = True,
+        allocate_on_comm_stream: bool = True,
+    ):
+        # 内网用moe_paired_a2a_communicate(会有padding)时，permutated_local_input_tokens可以直接通过all_to_all通信得到
+        # self.tp_ep_group 就是内网的self.ep_etp_group
+        permutated_local_input_tokens = all_to_all(
+            self.tp_ep_group, hidden_states, self.input_splits, self.output_splits
+        )
+        return permutated_local_input_tokens
+
+    def combine_postprocess(self, permutated_local_input_tokens):
+        collapsed_tokens = self._collapse_etp_partial_outputs(permutated_local_input_tokens)
+
+        if self.shared_experts is not None:
+            self.shared_experts.linear_fc2_forward(collapsed_tokens)
+            self.shared_experts.post_forward_comm()
+
+        # Unpermutation 1: AlltoAll output to output
+        output = unpermute(
+            collapsed_tokens,
+            self.reversed_local_input_permutation_mapping,
+            restore_shape=self.hidden_shape_before_permute,
+            routing_map=self.routing_map,
+            fused=self.config.moe_permute_fusion,
+            drop_and_pad=self.drop_and_pad,
+        )
+
+        output = output.view(self.hidden_shape)
+
+        if self.shared_experts is not None:
+            shared_expert_output = self.shared_experts.get_output()
+            output += shared_expert_output
+        return output
+
+    def _maybe_update_cuda_sync_point(self, point: str):
+        if (
+            self.cuda_sync_point_priority[point]
+            < self.cuda_sync_point_priority[self.cuda_sync_point]
+        ):
+            self.cuda_sync_point = point
+
+    def _maybe_dtoh_and_synchronize(
+        self, point: str, tokens_per_expert: torch.Tensor = None
+    ) -> torch.Tensor:
+        if not self.drop_and_pad:
+            if point == self.cuda_dtoh_point:
+                on_side_stream = torch.cuda.current_stream() != self.cuda_dtoh_stream
+                if on_side_stream:
+                    self.cuda_dtoh_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.cuda_dtoh_stream):
+                    tokens_per_expert = maybe_move_tensor_to_cpu(
+                        tokens_per_expert, record_stream=on_side_stream
+                    )
+                    self.input_splits = maybe_move_tensor_to_cpu(
+                        self.input_splits, as_numpy=True, record_stream=on_side_stream
+                    )
+                    self.output_splits = maybe_move_tensor_to_cpu(
+                        self.output_splits, as_numpy=True, record_stream=on_side_stream
+                    )
+                    self.num_tokens_per_target_rank_local_expert = maybe_move_tensor_to_cpu(
+                        self.num_tokens_per_target_rank_local_expert,
+                        as_numpy=True,
+                        record_stream=on_side_stream,
+                    )
+                    self.num_out_tokens = maybe_move_tensor_to_cpu(
+                        self.num_out_tokens, record_stream=on_side_stream
+                    )
+                    if (
+                        self.num_local_experts > 1
+                        or (self.ep_size > 1 and self.tp_size > 1)
+                    ) and not self.config.moe_permute_fusion:
+                        self.num_global_tokens_per_local_expert = maybe_move_tensor_to_cpu(
+                            self.num_global_tokens_per_local_expert, record_stream=on_side_stream
+                        )
+                self.d2h_event = self.cuda_dtoh_stream.record_event()
+
+            if point == self.cuda_sync_point:
+                # 内网这里是进行pass
                 self.d2h_event.synchronize()
 
         return tokens_per_expert

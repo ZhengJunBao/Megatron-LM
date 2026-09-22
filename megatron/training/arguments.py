@@ -2788,7 +2788,7 @@ def _add_moe_args(parser):
                        help='Enable per-layer logging for MoE, currently supports auxiliary loss and z loss.')
     # Token dispatcher arguments
     group.add_argument('--moe-token-dispatcher-type', type=str,
-                       choices=['allgather', 'alltoall', 'flex'],
+                       choices=['allgather', 'alltoall', 'alltoallsdc', 'flex'],
                        default='allgather',
                        help="The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather', 'alltoall'. We recommend using 'alltoall' when applying expert parallelism. For more information, please refer to the documentation in core/moe/README.")
     group.add_argument('--moe-enable-deepep', action='store_true',

@@ -14,6 +14,7 @@ from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
     MoEAlltoAllTokenDispatcher,
+    SDCMoEAlltoAllTokenDispatcher,
     MoEFlexTokenDispatcher,
     MoETokenDispatcher,
 )
@@ -129,6 +130,13 @@ class MoELayer(BaseMoELayer):
             )
         elif config.moe_token_dispatcher_type == "alltoall":
             self.token_dispatcher = MoEAlltoAllTokenDispatcher(
+                self.num_local_experts,
+                self.local_expert_indices,
+                config=self.config,
+                model_comm_pgs=model_comm_pgs,
+            )
+        elif config.moe_token_dispatcher_type == "alltoallsdc":
+            self.token_dispatcher = SDCMoEAlltoAllTokenDispatcher(
                 self.num_local_experts,
                 self.local_expert_indices,
                 config=self.config,
