@@ -192,6 +192,12 @@ class MoELayer(BaseMoELayer):
                 hidden_states.view(-1, hidden_states.shape[-1]), pad_meta
             )
             self.token_dispatcher.set_expert_pad_meta(pad_meta, residual.shape)
+        else:
+            # The router may have padded on an earlier pass (its ``last_pad_meta`` is only
+            # refreshed when padding is on), so drop any padding the dispatcher still holds.
+            # Without this an unpadded pass would be treated as padded and the dispatcher
+            # would expect ``N + E * m`` rows while receiving ``N``.
+            self.token_dispatcher.clear_expert_pad_meta()
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )

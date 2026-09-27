@@ -213,6 +213,19 @@ class MoETokenDispatcher:
         self.pad_meta = pad_meta
         self.original_hidden_shape = original_hidden_shape
 
+    def clear_expert_pad_meta(self) -> None:
+        """Forget any router-side padding recorded by a previous forward pass.
+
+        The padding is a run-wide setting, so a normal training run only ever calls
+        :meth:`set_expert_pad_meta` or never pads at all. Tools that toggle
+        ``moe_router_expert_pad_multiple`` inside one process (unit tests, precision
+        probes) must call this before an unpadded forward pass, otherwise the stale
+        ``pad_meta`` makes the dispatcher expect padded tokens and fail with a
+        ``[N]`` vs ``[N + E * m]`` shape mismatch.
+        """
+        self.pad_meta = None
+        self.original_hidden_shape = None
+
 
 class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
     """

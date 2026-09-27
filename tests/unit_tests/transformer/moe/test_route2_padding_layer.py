@@ -191,6 +191,53 @@ def test_set_expert_pad_meta_is_recorded_on_the_base_dispatcher():
     assert dispatcher.pad_meta is marker
     assert dispatcher.original_hidden_shape == torch.Size([32, HIDDEN])
 
+
+def test_clear_expert_pad_meta_drops_recorded_padding():
+    dispatcher = object.__new__(SDCMoEAlltoAllTokenDispatcher)
+    dispatcher.pad_meta = None
+    dispatcher.original_hidden_shape = None
+    dispatcher.set_expert_pad_meta(object(), torch.Size([32, HIDDEN]))
+
+    dispatcher.clear_expert_pad_meta()
+
+    assert dispatcher.pad_meta is None
+    assert dispatcher.original_hidden_shape is None
+
+
+def test_toggling_expert_pad_multiple_between_forward_passes(monkeypatch):
+    """An unpadded pass must work even right after a padded one.
+
+    ``set_expert_pad_meta`` is only called while padding is on, so the dispatcher has to be
+    told when the padding goes away. Without ``clear_expert_pad_meta`` the stale ``pad_meta``
+    makes the dispatcher slice/expect ``N + E * m`` rows and the pass dies with
+    "size of tensor a (32) must match the size of tensor b (40)".
+    """
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        layer = _moe_layer()
+        tokens = torch.randn(NUM_TOKENS, HIDDEN, device="cuda", dtype=torch.bfloat16)
+
+        def run():
+            output = layer(tokens)
+            return output[0] if isinstance(output, tuple) else output
+
+        layer.router.expert_pad_multiple = None
+        assert run().shape == tokens.shape
+        assert layer.token_dispatcher.pad_meta is None
+
+        layer.router.expert_pad_multiple = M
+        assert run().shape == tokens.shape
+        assert layer.token_dispatcher.pad_meta is not None
+
+        layer.router.expert_pad_multiple = None
+        assert run().shape == tokens.shape
+        assert layer.token_dispatcher.pad_meta is None
+    finally:
+        Utils.destroy_model_parallel()
+
+
 _FUSED_PROBE = """\
 import sys
 

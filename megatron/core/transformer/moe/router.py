@@ -471,6 +471,11 @@ class TopKRouter(Router):
 
         if self.expert_pad_multiple is not None:
             scores, routing_map = self.pad_for_expert_multiple(scores, routing_map)
+        else:
+            # Drop a previous forward's padding. ``last_pad_meta`` is only written while
+            # padding is on, so without this an unpadded pass would still advertise the
+            # previous padded pool and the dispatcher would look for rows that are gone.
+            self.last_pad_meta = None
 
         return scores, routing_map
 
@@ -505,5 +510,12 @@ class TopKRouter(Router):
         return padded_probs, routing_map
 
     def get_expert_pad_meta(self) -> Optional[ExpertPadMeta]:
-        """Return the metadata of the padding applied by the last forward pass."""
+        """Return the metadata of the padding applied by the last forward pass.
+
+        Returns ``None`` whenever expert padding is disabled, even if an earlier pass
+        padded. The padding is a run-wide setting, and callers must never act on stale
+        metadata left behind by a previous configuration.
+        """
+        if self.expert_pad_multiple is None:
+            return None
         return self.last_pad_meta
