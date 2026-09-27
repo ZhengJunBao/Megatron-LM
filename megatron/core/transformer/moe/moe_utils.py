@@ -1,7 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import math
-from typing import List, Optional, Union
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -524,6 +525,262 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
 
     routing_map = routing_map.transpose(0, 1)
     return routing_map
+
+
+@dataclass
+class ExpertPadMeta:
+    """Metadata for router-side expert-multiple padding (MoE route 2).
+
+    The router appends dummy rows to its outputs so that every expert has a number of
+    routed rows that is a multiple of ``multiple``. Dummy rows carry zero probs and are
+    the only rows that make a routing_map zero entry become a one; the real token rows are
+    never modified.
+
+    Layout: expert ``e`` owns the fixed-size reservation ``[N + e * m, N + (e + 1) * m)``.
+    The first ``dummy_counts[e]`` rows of that reservation are enabled (routing_map entry
+    set to True), the remaining ``m - dummy_counts[e]`` rows stay zero. The reservation
+    size is fixed so downstream buffer shapes do not depend on the token distribution.
+    """
+
+    multiple: int
+    """The alignment multiple ``m`` (> 0)."""
+
+    original_num_tokens: int
+    """Number of real tokens ``N`` before padding."""
+
+    num_experts: int
+    """Number of global experts ``E`` (= routing_map.shape[1])."""
+
+    counts: torch.Tensor
+    """Per-expert real routed row counts ``c[e]``, shape ``[E]`` int64."""
+
+    dummy_counts: torch.Tensor
+    """Per-expert enabled dummy counts ``d[e]``, shape ``[E]`` int64, each in ``[0, m]``."""
+
+    @property
+    def num_dummy(self) -> int:
+        """Total number of enabled dummy rows ``D``."""
+        return int(self.dummy_counts.sum().item())
+
+    @property
+    def reserved_rows(self) -> int:
+        """Fixed reservation size ``R = E * m`` (all zeros and dummies together)."""
+        return self.num_experts * self.multiple
+
+    @property
+    def padded_num_tokens(self) -> int:
+        """Row count of the padded routing_map / token pool: ``N + R``."""
+        return self.original_num_tokens + self.reserved_rows
+
+    @property
+    def num_routed_rows(self) -> int:
+        """Routed token-expert pairs after padding: ``Q2 = sum(c[e] + d[e])``."""
+        return int(self.counts.sum().item()) + self.num_dummy
+
+    def expected_num_out_tokens(self, tp_size: int) -> int:
+        """A2A send row count ``S2 = ETP * Q2`` (the physical permute output size)."""
+        return self.num_routed_rows * tp_size
+
+
+def compute_expert_pad_dummy_counts(
+    counts: torch.Tensor, multiple: int
+) -> torch.Tensor:
+    """Number of dummy rows to append per expert so each count becomes a multiple of m.
+
+    ``d[e] = (m - c[e] % m) % m`` for ``c[e] > 0``. An expert that receives no real token
+    at all (``c[e] == 0``) is padded with a full block of ``m`` rows, so that every sender
+    still contributes a whole aligned block for it. Experts whose count is already a
+    positive multiple of ``m`` get no dummy rows.
+
+    Args:
+        counts (torch.Tensor): Per-expert routed row counts, shape ``[E]``.
+        multiple (int): Alignment multiple ``m``, must be positive.
+
+    Returns:
+        torch.Tensor: Per-expert dummy counts, shape ``[E]``, dtype of ``counts``.
+    """
+    assert multiple > 0, f"multiple must be positive, got {multiple}"
+    counts = counts.long()
+    dummy_counts = (multiple - counts % multiple) % multiple
+    return torch.where(
+        counts == 0, torch.full_like(dummy_counts, multiple), dummy_counts
+    )
+
+
+def pad_row_count_for_expert_multiple(num_tokens: int, multiple: int, num_experts: int) -> int:
+    """Row count after padding: ``N + E * m``."""
+    assert multiple > 0, f"multiple must be positive, got {multiple}"
+    return num_tokens + num_experts * multiple
+
+
+def pad_routing_map_for_expert_multiple(
+    routing_map: torch.Tensor, multiple: int
+) -> Tuple[torch.Tensor, ExpertPadMeta]:
+    """Append dummy rows so every expert has a multiple of ``multiple`` routed rows.
+
+    Unlike :func:`pad_routing_map`, which flips existing zeros of real tokens in place, this
+    appends new rows at the bottom of the map and leaves the real rows bit-identical.
+
+    Args:
+        routing_map (torch.Tensor): Token to expert map, ``[N, E]`` bool.
+        multiple (int): Alignment multiple ``m``, must be positive.
+
+    Returns:
+        Tuple[torch.Tensor, ExpertPadMeta]: The padded map ``[N + E * m, E]`` and its
+        metadata.
+    """
+    assert routing_map.dim() == 2, f"routing_map must be 2D, got {routing_map.dim()}"
+    assert multiple > 0, f"multiple must be positive, got {multiple}"
+    num_tokens, num_experts = routing_map.shape
+
+    counts = routing_map.sum(dim=0).long()
+    dummy_counts = compute_expert_pad_dummy_counts(counts, multiple)
+
+    padded = torch.zeros(
+        (pad_row_count_for_expert_multiple(num_tokens, multiple, num_experts), num_experts),
+        dtype=routing_map.dtype,
+        device=routing_map.device,
+    )
+    padded[:num_tokens] = routing_map
+
+    # Expert e owns [N + e*m, N + (e+1)*m); enable only its first d[e] rows.
+    slots = torch.arange(multiple, device=routing_map.device).unsqueeze(0).expand(num_experts, -1)
+    enabled = slots < dummy_counts.unsqueeze(1)
+    col_starts = num_tokens + torch.arange(
+        num_experts, device=routing_map.device
+    ) * multiple
+    rows = (col_starts.unsqueeze(1) + slots).reshape(-1)
+    cols = (
+        torch.arange(num_experts, device=routing_map.device)
+        .unsqueeze(1)
+        .expand(num_experts, multiple)
+        .reshape(-1)
+    )
+    enabled = enabled.reshape(-1)
+    padded[rows[enabled], cols[enabled]] = True
+
+    meta = ExpertPadMeta(
+        multiple=multiple,
+        original_num_tokens=num_tokens,
+        num_experts=num_experts,
+        counts=counts,
+        dummy_counts=dummy_counts,
+    )
+    return padded, meta
+
+
+def pad_token_pool_for_expert_multiple(
+    tensor: torch.Tensor, meta: ExpertPadMeta
+) -> torch.Tensor:
+    """Append zero rows to a per-token tensor so it matches the padded routing_map.
+
+    Used for the token pool (hidden states) and probs. The appended rows are never selected
+    by ``permute`` unless their routing_map entry was enabled by the padding, and they are
+    zero either way: a non-zero dummy hidden state would flow through the expert weights and
+    pollute the shared weight gradients even though its prob is zero.
+
+    Args:
+        tensor (torch.Tensor): Tensor whose first dim indexes tokens, ``[N, ...]``.
+        meta (ExpertPadMeta): Metadata produced by
+            :func:`pad_routing_map_for_expert_multiple`.
+
+    Returns:
+        torch.Tensor: ``[N + E * m, ...]``, with the real rows copied verbatim.
+    """
+    assert (
+        tensor.shape[0] == meta.original_num_tokens
+    ), f"expected {meta.original_num_tokens} rows to pad, got {tensor.shape[0]}"
+    if meta.reserved_rows == 0:
+        return tensor
+    padding = torch.zeros(
+        (meta.reserved_rows, *tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device
+    )
+    return torch.cat([tensor, padding], dim=0)
+
+
+def unpad_token_pool_for_expert_multiple(
+    tensor: torch.Tensor, meta: ExpertPadMeta
+) -> torch.Tensor:
+    """Drop the router-side reservation rows, restoring the original token pool.
+
+    This is a pure slice: gradients that flow back into the dropped rows are zero, which
+    matches "the dummy rows never contributed to the loss".
+
+    Args:
+        tensor (torch.Tensor): Padded tensor, ``[N + E * m, ...]``.
+        meta (ExpertPadMeta): Metadata produced by
+            :func:`pad_routing_map_for_expert_multiple`.
+
+    Returns:
+        torch.Tensor: ``[N, ...]``.
+    """
+    assert (
+        tensor.shape[0] == meta.padded_num_tokens
+    ), f"expected {meta.padded_num_tokens} padded rows, got {tensor.shape[0]}"
+    return tensor[: meta.original_num_tokens]
+
+
+def check_expert_pad_invariants(
+    routing_map: torch.Tensor,
+    padded_routing_map: torch.Tensor,
+    meta: ExpertPadMeta,
+) -> List[str]:
+    """Check the route-2 padding invariants, returning a list of violations (empty if ok).
+
+    Only intended for tests and diagnostics; it is never called on the training path.
+
+    Args:
+        routing_map (torch.Tensor): The unpadded map, ``[N, E]``.
+        padded_routing_map (torch.Tensor): The padded map, ``[N + E * m, E]``.
+        meta (ExpertPadMeta): Metadata produced by
+            :func:`pad_routing_map_for_expert_multiple`.
+
+    Returns:
+        List[str]: Human readable violations.
+    """
+    problems = []
+    n, e = meta.original_num_tokens, meta.num_experts
+    m, r = meta.multiple, meta.reserved_rows
+
+    if tuple(padded_routing_map.shape) != (n + r, e):
+        problems.append(f"padded shape {tuple(padded_routing_map.shape)} != {(n + r, e)}")
+        return problems
+
+    if not torch.equal(padded_routing_map[:n], routing_map):
+        problems.append("real token rows were modified")
+
+    column_counts = padded_routing_map.sum(dim=0)
+    bad = (column_counts % m != 0).nonzero().flatten().tolist()
+    if bad:
+        problems.append(f"columns not aligned to {m}: {bad}")
+
+    expected = meta.counts + meta.dummy_counts
+    if not torch.equal(column_counts, expected):
+        problems.append(
+            f"column counts {column_counts.tolist()} != c + d {expected.tolist()}"
+        )
+
+    dummy_block = padded_routing_map[n:]
+    per_row = dummy_block.sum(dim=1)
+    if bool((per_row > 1).any()):
+        problems.append("a dummy row selects more than one expert")
+
+    # No expert may enable more than its fixed reservation of m rows.
+    if int(meta.dummy_counts.max().item()) > m:
+        problems.append("an expert has more than m dummy rows")
+
+    reserved = dummy_block.reshape(e, m, e)
+    for expert in range(e):
+        enabled = int(meta.dummy_counts[expert].item())
+        if enabled and not bool(reserved[expert, :enabled, expert].all()):
+            problems.append(f"expert {expert} dummy block is not enabled contiguously")
+        if enabled < m and bool(reserved[expert, enabled:, expert].any()):
+            problems.append(f"expert {expert} has enabled slots past its dummy count")
+
+    if int(routing_map.sum().item()) + meta.num_dummy != meta.num_routed_rows:
+        problems.append("num_routed_rows does not equal sum(real) + D")
+
+    return problems
 
 
 def topk_softmax_with_capacity(
