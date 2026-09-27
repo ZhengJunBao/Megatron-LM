@@ -22,6 +22,7 @@ from megatron.core.transformer.moe.fused_a2a import (
     set_deepep_num_sms,
 )
 from megatron.core.transformer.moe.moe_utils import (
+    ExpertPadMeta,
     ModelCommProcessGroups,
     get_capacity,
     maybe_move_tensor_to_cpu,
@@ -61,6 +62,12 @@ class MoETokenDispatcher:
         """
         self.config = config
         self.shared_experts: Optional[SharedExpertMLP] = None
+
+        # Route-2 router-side expert m-alignment padding. When set, the tokens / routing map
+        # / probs handed to this dispatcher already contain the router reservation rows and
+        # ``original_hidden_shape`` is the shape to restore after the combine.
+        self.pad_meta: Optional[ExpertPadMeta] = None
+        self.original_hidden_shape: Optional[torch.Size] = None
 
         self.ep_group = model_comm_pgs.ep
         # use model_comm_pgs.expt_tp_group as tensor parallel group in this module.
@@ -192,6 +199,19 @@ class MoETokenDispatcher:
         """Set shared expert to the dispatcher."""
         assert self.config.moe_shared_expert_overlap
         self.shared_experts = shared_experts
+
+    def set_expert_pad_meta(
+        self, pad_meta: ExpertPadMeta, original_hidden_shape: torch.Size
+    ) -> None:
+        """Record the router-side padding that the incoming tokens already carry.
+
+        Args:
+            pad_meta (ExpertPadMeta): Metadata produced by the router padding.
+            original_hidden_shape (torch.Size): Shape of the MoE layer input, i.e. the shape
+                the combine must restore after dropping the reservation rows.
+        """
+        self.pad_meta = pad_meta
+        self.original_hidden_shape = original_hidden_shape
 
 
 class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
@@ -1079,7 +1099,11 @@ class SDCMoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         if (
             self.config.moe_expert_capacity_factor is not None
             or self.config.moe_router_padding_for_fp8
+            or self.pad_meta is not None
         ):
+            # Route 2: the routing map already carries the router reservation rows, so the
+            # permute output size is S2 = ETP * (sum(c) + D) and must not be recomputed from
+            # num_tokens * topk (which knows nothing about the padding).
             self.num_out_tokens = num_local_tokens_per_expert.sum() * self.tp_size
             self._maybe_update_cuda_sync_point("before_permutation_1")
         else:
@@ -1324,6 +1348,14 @@ class SDCMoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         if self.shared_experts is not None:
             shared_expert_output = self.shared_experts.get_output()
             output += shared_expert_output
+
+        if self.pad_meta is not None:
+            # Route 2, step 11: the router reservation rows were only placeholders for the
+            # expert m-alignment; drop them and restore the MoE layer input shape. This is a
+            # pure slice, so the backward pass sends zero gradient into the dropped rows.
+            output = output[: self.pad_meta.original_num_tokens].reshape(
+                self.original_hidden_shape
+            )
         return output
 
     def _maybe_update_cuda_sync_point(self, point: str):

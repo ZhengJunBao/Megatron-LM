@@ -9,7 +9,10 @@ import torch
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe.moe_utils import get_default_model_comm_pgs
+from megatron.core.transformer.moe.moe_utils import (
+    get_default_model_comm_pgs,
+    pad_token_pool_for_expert_multiple,
+)
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
@@ -180,6 +183,15 @@ class MoELayer(BaseMoELayer):
         """
         residual = hidden_states
         probs, routing_map = self.router(hidden_states)
+        pad_meta = self.router.get_expert_pad_meta()
+        if pad_meta is not None:
+            # Route 2: the router already appended the expert-alignment reservation to probs
+            # and the routing map, so the token pool has to grow with it before it is handed
+            # to the dispatcher. The residual keeps the unpadded input shape.
+            hidden_states = pad_token_pool_for_expert_multiple(
+                hidden_states.view(-1, hidden_states.shape[-1]), pad_meta
+            )
+            self.token_dispatcher.set_expert_pad_meta(pad_meta, residual.shape)
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
