@@ -407,6 +407,13 @@ class TransformerConfig(ModelParallelConfig):
     is a multiple of 16/32 for FP8 precision. This can remove the explicit padding in the
     GroupedMLP layer."""
 
+    moe_router_expert_pad_multiple: Optional[int] = None
+    """Pad each expert's routed token count to a multiple of this value by appending dummy
+    rows in the router output (routing_map / probs / hidden states), instead of padding inside
+    the permute step. Dummy rows have zero probs and are never routed to a random expert.
+    Only supported by the 'alltoallsdc' token dispatcher in the dropless regime.
+    None disables the padding (default)."""
+
     moe_router_num_groups: Optional[int] = None
     """Number of groups to divide experts into for group-limited routing.
     When using group-limited routing:
@@ -1128,6 +1135,33 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "allgather and alltoall_seq dispatcher does not support "
                     "moe_router_padding_for_fp8."
+                )
+
+        if self.moe_router_expert_pad_multiple is not None:
+            if self.moe_router_expert_pad_multiple <= 0:
+                raise ValueError(
+                    "moe_router_expert_pad_multiple must be a positive integer, "
+                    f"but got {self.moe_router_expert_pad_multiple}."
+                )
+
+            if self.moe_token_dispatcher_type != "alltoallsdc":
+                raise ValueError(
+                    "moe_router_expert_pad_multiple is only supported by the 'alltoallsdc' "
+                    f"token dispatcher, but got '{self.moe_token_dispatcher_type}'."
+                )
+
+            if self.moe_expert_capacity_factor is not None:
+                raise ValueError(
+                    "moe_router_expert_pad_multiple is not supported together with "
+                    "moe_expert_capacity_factor: after token dropping the routed token count "
+                    "no longer matches the top-k routing count."
+                )
+
+            if self.moe_router_padding_for_fp8:
+                raise ValueError(
+                    "moe_router_expert_pad_multiple is not supported together with "
+                    "moe_router_padding_for_fp8: the latter flips existing routing_map zeros "
+                    "in place, while the former appends new dummy rows."
                 )
 
         if (
