@@ -8,9 +8,11 @@ import torch
 
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
+    ExpertPadMeta,
     ModelCommProcessGroups,
     MoEAuxLossAutoScaler,
     apply_random_logits,
+    pad_routing_map_for_expert_multiple,
     router_gating_linear,
     save_to_aux_losses_tracker,
     sequence_load_balancing_loss_func,
@@ -127,6 +129,9 @@ class TopKRouter(Router):
         self.routing_type = self.config.moe_router_load_balancing_type
         self.score_function = self.config.moe_router_score_function
         self.input_jitter = None
+        # Route-2 expert m-alignment padding (None disables it).
+        self.expert_pad_multiple = self.config.moe_router_expert_pad_multiple
+        self.last_pad_meta: Optional[ExpertPadMeta] = None
 
         self.enable_expert_bias = self.config.moe_router_enable_expert_bias
         if self.enable_expert_bias:
@@ -445,6 +450,12 @@ class TopKRouter(Router):
 
         Args:
             input (torch.Tensor): Input tensor.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Routing probabilities and the routing map.
+            When ``moe_router_expert_pad_multiple`` is set, both tensors already contain the
+            appended expert-alignment reservation rows (see :meth:`pad_for_expert_multiple`)
+            and their padded shape is exposed through :meth:`get_expert_pad_meta`.
         """
         self._maintain_float32_expert_bias()
 
@@ -458,4 +469,41 @@ class TopKRouter(Router):
 
         scores, routing_map = self.routing(logits)
 
+        if self.expert_pad_multiple is not None:
+            scores, routing_map = self.pad_for_expert_multiple(scores, routing_map)
+
         return scores, routing_map
+
+    def pad_for_expert_multiple(self, probs: torch.Tensor, routing_map: torch.Tensor):
+        """Pad the router output so every expert has a multiple of ``m`` routed rows.
+
+        Route 2 moves the expert m-alignment padding from ``moe_permute`` into the router:
+        instead of flipping zeros of the existing map in place (which would silently change
+        the routing of real tokens), this appends a fixed-size reservation of ``E * m`` dummy
+        rows below the real tokens. Only the first ``d[e]`` slots of expert ``e``'s reservation
+        are enabled in the map, so ``1`` entries still mean "send", ``0`` entries are pure
+        placeholders and are neither sent nor routed.
+
+        Must run *after* the aux-loss / z-loss accumulation and after
+        ``local_tokens_per_expert`` has been updated, so the load-balancing statistics only
+        ever see real tokens.
+
+        Args:
+            probs (torch.Tensor): Routing probs of the real tokens, ``[N, E]``.
+            routing_map (torch.Tensor): Routing map of the real tokens, ``[N, E]``.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Padded probs and map, ``[N + E * m, E]``.
+        """
+        num_tokens = probs.shape[0]
+        routing_map, meta = pad_routing_map_for_expert_multiple(routing_map, self.expert_pad_multiple)
+        padded_probs = torch.zeros(
+            (meta.padded_num_tokens, probs.shape[1]), dtype=probs.dtype, device=probs.device
+        )
+        padded_probs[:num_tokens] = probs
+        self.last_pad_meta = meta
+        return padded_probs, routing_map
+
+    def get_expert_pad_meta(self) -> Optional[ExpertPadMeta]:
+        """Return the metadata of the padding applied by the last forward pass."""
+        return self.last_pad_meta
