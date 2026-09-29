@@ -8,9 +8,11 @@ import torch
 
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
+    ExpertPadMeta,
     ModelCommProcessGroups,
     MoEAuxLossAutoScaler,
     apply_random_logits,
+    pad_routing_map_for_expert_multiple,
     router_gating_linear,
     save_to_aux_losses_tracker,
     sequence_load_balancing_loss_func,
@@ -127,6 +129,9 @@ class TopKRouter(Router):
         self.routing_type = self.config.moe_router_load_balancing_type
         self.score_function = self.config.moe_router_score_function
         self.input_jitter = None
+        # 路线 2 的 expert m 对齐 padding 倍数（None 表示关闭）
+        self.expert_pad_multiple = self.config.moe_router_expert_pad_multiple
+        self.last_pad_meta: Optional[ExpertPadMeta] = None
 
         self.enable_expert_bias = self.config.moe_router_enable_expert_bias
         if self.enable_expert_bias:
@@ -445,6 +450,11 @@ class TopKRouter(Router):
 
         Args:
             input (torch.Tensor): Input tensor.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: 路由概率和 routing map。
+            若设置了 ``moe_router_expert_pad_multiple``，两者末尾已追加对齐预留区行，
+            其形状元数据见 :meth:`get_expert_pad_meta`。
         """
         self._maintain_float32_expert_bias()
 
@@ -458,4 +468,34 @@ class TopKRouter(Router):
 
         scores, routing_map = self.routing(logits)
 
+        if self.expert_pad_multiple is not None:
+            scores, routing_map = self.pad_for_expert_multiple(scores, routing_map)
+        else:
+            # last_pad_meta 只在 padding 开启时刷新；这里显式清空，
+            # 避免未 padding 的前向把上一轮的旧元数据留给 dispatcher。
+            self.last_pad_meta = None
+
         return scores, routing_map
+
+    def pad_for_expert_multiple(self, probs: torch.Tensor, routing_map: torch.Tensor):
+        """在 router 输出末尾追加路线 2 的 expert m 对齐预留区。
+
+        真实 token 行从不修改；只追加 E*m 行 dummy（probs 为 0），且专家 e 仅启用其
+        预留区的前 d[e] 个槽位。必须在 aux loss / z loss 累计和
+        ``local_tokens_per_expert`` 更新之后调用，保证负载均衡统计只看到真实 token。
+        """
+        num_tokens = probs.shape[0]
+        routing_map, meta = pad_routing_map_for_expert_multiple(routing_map, self.expert_pad_multiple)
+        padded_probs = torch.zeros(
+            (meta.padded_num_tokens, probs.shape[1]), dtype=probs.dtype, device=probs.device
+        )
+        padded_probs[:num_tokens] = probs
+        self.last_pad_meta = meta
+        return padded_probs, routing_map
+
+    def get_expert_pad_meta(self) -> Optional[ExpertPadMeta]:
+        """上一次前向应用的 padding 元数据；只要 padding 关闭就返回 None
+        （调用方绝不能使用配置切换前留下的过期元数据）。"""
+        if self.expert_pad_multiple is None:
+            return None
+        return self.last_pad_meta

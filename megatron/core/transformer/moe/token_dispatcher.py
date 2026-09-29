@@ -22,6 +22,7 @@ from megatron.core.transformer.moe.fused_a2a import (
     set_deepep_num_sms,
 )
 from megatron.core.transformer.moe.moe_utils import (
+    ExpertPadMeta,
     ModelCommProcessGroups,
     get_capacity,
     maybe_move_tensor_to_cpu,
@@ -61,6 +62,11 @@ class MoETokenDispatcher:
         """
         self.config = config
         self.shared_experts: Optional[SharedExpertMLP] = None
+
+        # 路线 2 的 Router 侧 expert m 对齐 padding：非 None 时，传进来的
+        # tokens / routing map / probs 已经带有 router 追加的预留区行。
+        self.pad_meta: Optional[ExpertPadMeta] = None
+        self.original_hidden_shape: Optional[torch.Size] = None
 
         self.ep_group = model_comm_pgs.ep
         # use model_comm_pgs.expt_tp_group as tensor parallel group in this module.
@@ -192,6 +198,21 @@ class MoETokenDispatcher:
         """Set shared expert to the dispatcher."""
         assert self.config.moe_shared_expert_overlap
         self.shared_experts = shared_experts
+
+    def set_expert_pad_meta(
+        self, pad_meta: ExpertPadMeta, original_hidden_shape: torch.Size
+    ) -> None:
+        """记录传入 tokens 已携带的 router 侧 padding，
+        以及 combine 之后要恢复的 MoE 层输入形状。"""
+        self.pad_meta = pad_meta
+        self.original_hidden_shape = original_hidden_shape
+
+    def clear_expert_pad_meta(self) -> None:
+        """丢弃上一轮前向记录的 padding。在同一进程内切换
+        ``moe_router_expert_pad_multiple``（测试、精度探针）时必须调用，
+        否则过期元数据会让 dispatcher 按 ``N + E * m`` 行等待输入而报形状不匹配。"""
+        self.pad_meta = None
+        self.original_hidden_shape = None
 
 
 class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
@@ -1079,7 +1100,10 @@ class SDCMoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         if (
             self.config.moe_expert_capacity_factor is not None
             or self.config.moe_router_padding_for_fp8
+            or self.pad_meta is not None
         ):
+            # 路线 2：routing map 已包含预留区行，permute 输出行数
+            # 是 ETP * (sum(c) + D)，不能再按 num_tokens * topk 估算。
             self.num_out_tokens = num_local_tokens_per_expert.sum() * self.tp_size
             self._maybe_update_cuda_sync_point("before_permutation_1")
         else:
@@ -1324,6 +1348,13 @@ class SDCMoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         if self.shared_experts is not None:
             shared_expert_output = self.shared_experts.get_output()
             output += shared_expert_output
+
+        if self.pad_meta is not None:
+            # 路线 2：丢掉预留区行，把输出切回 MoE 层的输入形状。
+            # 纯切片操作，反向传播时自动给被丢弃的行补零梯度。
+            output = output[: self.pad_meta.original_num_tokens].reshape(
+                self.original_hidden_shape
+            )
         return output
 
     def _maybe_update_cuda_sync_point(self, point: str):

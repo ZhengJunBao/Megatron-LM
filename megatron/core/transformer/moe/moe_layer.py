@@ -9,7 +9,10 @@ import torch
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe.moe_utils import get_default_model_comm_pgs
+from megatron.core.transformer.moe.moe_utils import (
+    get_default_model_comm_pgs,
+    pad_token_pool_for_expert_multiple,
+)
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
@@ -180,6 +183,18 @@ class MoELayer(BaseMoELayer):
         """
         residual = hidden_states
         probs, routing_map = self.router(hidden_states)
+        pad_meta = self.router.get_expert_pad_meta()
+        if pad_meta is not None:
+            # 路线 2：router 已经在 probs 和 routing map 末尾追加了对齐预留区，
+            # token 池也要同样补零行才能一起交给 dispatcher。
+            # 注意 residual 保持未 padding 的原始形状。
+            hidden_states = pad_token_pool_for_expert_multiple(
+                hidden_states.view(-1, hidden_states.shape[-1]), pad_meta
+            )
+            self.token_dispatcher.set_expert_pad_meta(pad_meta, residual.shape)
+        else:
+            # 清掉之前某次 padded 前向留下的元数据（元数据只在 padding 开启时刷新）。
+            self.token_dispatcher.clear_expert_pad_meta()
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )

@@ -1,7 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import math
-from typing import List, Optional, Union
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -524,6 +525,104 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
 
     routing_map = routing_map.transpose(0, 1)
     return routing_map
+
+
+@dataclass
+class ExpertPadMeta:
+    """路线 2「Router 侧 expert m 对齐 padding」的元数据。
+
+    专家 e 独占预留区 [N + e*m, N + (e+1)*m)，其中只有前 dummy_counts[e] 行被启用。
+    预留区大小固定为 E*m，与 token 分布无关，下游 buffer 形状因此保持静态。
+    """
+
+    multiple: int               # 对齐倍数 m
+    original_num_tokens: int    # padding 前的真实 token 数 N
+    num_experts: int            # 全局专家数 E
+    counts: torch.Tensor        # 每个专家的真实行数 c[e]，shape [E]
+    dummy_counts: torch.Tensor  # 每个专家启用的 dummy 行数 d[e]，shape [E]
+
+    @property
+    def reserved_rows(self) -> int:
+        return self.num_experts * self.multiple
+
+    @property
+    def padded_num_tokens(self) -> int:
+        return self.original_num_tokens + self.reserved_rows
+
+
+def compute_expert_pad_dummy_counts(
+    counts: torch.Tensor, multiple: int
+) -> torch.Tensor:
+    """每个专家需要补多少 dummy 行，使其总行数对齐到 m 的倍数。
+
+    d[e] = (m - c[e] % m) % m。特例：c[e] == 0 时补满 m 行——没有真实 token 的专家
+    也保留一块完整的对齐数据，避免通信/计算出现 0 长度的边界情况。
+    """
+    assert multiple > 0, f"multiple must be positive, got {multiple}"
+    counts = counts.long()
+    dummy_counts = (multiple - counts % multiple) % multiple
+    return torch.where(
+        counts == 0, torch.full_like(dummy_counts, multiple), dummy_counts
+    )
+
+
+def pad_routing_map_for_expert_multiple(
+    routing_map: torch.Tensor, multiple: int
+) -> Tuple[torch.Tensor, ExpertPadMeta]:
+    """在 routing_map 末尾追加固定的 E*m 行预留区，使每个专家的行数对齐到 m 的倍数。
+
+    与 :func:`pad_routing_map`（就地翻转真实 token 的 0，会改变真实路由）不同，
+    真实行逐位不变；预留区中专家 e 只占自己的 m 行，且仅前 d[e] 行在其列上置 1。
+    1 仍然表示「发送」，0 只是占位，既不发送也不参与路由。
+
+    返回 padding 后的 map（[N + E*m, E]）和元数据。
+    """
+    assert routing_map.dim() == 2, f"routing_map must be 2D, got {routing_map.dim()}"
+    assert multiple > 0, f"multiple must be positive, got {multiple}"
+    num_tokens, num_experts = routing_map.shape
+
+    counts = routing_map.sum(dim=0).long()
+    dummy_counts = compute_expert_pad_dummy_counts(counts, multiple)
+
+    padded = torch.zeros(
+        (num_tokens + num_experts * multiple, num_experts),
+        dtype=routing_map.dtype,
+        device=routing_map.device,
+    )
+    padded[:num_tokens] = routing_map
+
+    # 预留区看成一个 [E, m] 的块：block[e, j] = True 表示专家 e 启用它的第 j 个槽位。
+    # 摊平成 E*m 行后，第 e*m+j 行恰好是专家 e 的第 j 个槽位，只需在第 e 列置 1。
+    slots = torch.arange(multiple, device=routing_map.device)
+    block = slots.unsqueeze(0) < dummy_counts.unsqueeze(1)  # [E, m]
+    eye = torch.eye(num_experts, dtype=torch.bool, device=routing_map.device)  # [E, E]
+    padded[num_tokens:] = (block.unsqueeze(-1) & eye.unsqueeze(1)).reshape(-1, num_experts)
+
+    meta = ExpertPadMeta(
+        multiple=multiple,
+        original_num_tokens=num_tokens,
+        num_experts=num_experts,
+        counts=counts,
+        dummy_counts=dummy_counts,
+    )
+    return padded, meta
+
+
+def pad_token_pool_for_expert_multiple(
+    tensor: torch.Tensor, meta: ExpertPadMeta
+) -> torch.Tensor:
+    """给按 token 索引的张量（hidden states / probs）末尾补 E*m 行全零，
+    使其行数与 padding 后的 routing_map 对齐。补的行必须是零：dummy 行的 hidden 若非零，
+    即使 prob 为 0 也会流过专家权重、污染权重梯度。"""
+    assert (
+        tensor.shape[0] == meta.original_num_tokens
+    ), f"expected {meta.original_num_tokens} rows to pad, got {tensor.shape[0]}"
+    if meta.reserved_rows == 0:
+        return tensor
+    padding = torch.zeros(
+        (meta.reserved_rows, *tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device
+    )
+    return torch.cat([tensor, padding], dim=0)
 
 
 def topk_softmax_with_capacity(

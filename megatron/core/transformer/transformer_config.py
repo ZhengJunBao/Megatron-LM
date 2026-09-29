@@ -407,6 +407,12 @@ class TransformerConfig(ModelParallelConfig):
     is a multiple of 16/32 for FP8 precision. This can remove the explicit padding in the
     GroupedMLP layer."""
 
+    moe_router_expert_pad_multiple: Optional[int] = None
+    """路线 2：在 router 输出（routing_map / probs / hidden states）末尾追加 dummy 行，
+    把每个专家的 routed token 数补齐到该值的倍数，代替 permute 内部的 padding。
+    dummy 行 probs 为 0，不会被路由到任何专家。仅支持 alltoallsdc dispatcher 的
+    dropless 场景。None 表示关闭（默认）。"""
+
     moe_router_num_groups: Optional[int] = None
     """Number of groups to divide experts into for group-limited routing.
     When using group-limited routing:
@@ -1128,6 +1134,33 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "allgather and alltoall_seq dispatcher does not support "
                     "moe_router_padding_for_fp8."
+                )
+
+        if self.moe_router_expert_pad_multiple is not None:
+            if self.moe_router_expert_pad_multiple <= 0:
+                raise ValueError(
+                    "moe_router_expert_pad_multiple must be a positive integer, "
+                    f"but got {self.moe_router_expert_pad_multiple}."
+                )
+
+            if self.moe_token_dispatcher_type != "alltoallsdc":
+                raise ValueError(
+                    "moe_router_expert_pad_multiple is only supported by the 'alltoallsdc' "
+                    f"token dispatcher, but got '{self.moe_token_dispatcher_type}'."
+                )
+
+            if self.moe_expert_capacity_factor is not None:
+                raise ValueError(
+                    "moe_router_expert_pad_multiple is not supported together with "
+                    "moe_expert_capacity_factor: after token dropping the routed token count "
+                    "no longer matches the top-k routing count."
+                )
+
+            if self.moe_router_padding_for_fp8:
+                raise ValueError(
+                    "moe_router_expert_pad_multiple is not supported together with "
+                    "moe_router_padding_for_fp8: the latter flips existing routing_map zeros "
+                    "in place, while the former appends new dummy rows."
                 )
 
         if (
