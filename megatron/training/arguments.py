@@ -2778,6 +2778,10 @@ def _add_moe_args(parser):
                        'dropless training with FP8 precision when num_local_experts > 1. This is a more '
                        'efficient way to pad for FP8 which eliminates the explicit padding in the '
                        'GroupedMLP layer.')
+    group.add_argument('--moe-router-expert-pad-multiple', type=int, default=None,
+                       help='Append dummy rows to the routing map / probs / hidden states so that every '
+                       'expert receives a multiple of this value (2D stage only, before dispatch). '
+                       'Dummy rows are stripped again after combine. Requires the alltoallsdc dispatcher.')
     group.add_argument('--moe-aux-loss-coeff', type=float, default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
     group.add_argument('--moe-z-loss-coeff', type=float, default=None,

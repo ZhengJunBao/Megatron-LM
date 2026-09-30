@@ -62,6 +62,12 @@ class MoETokenDispatcher:
         self.config = config
         self.shared_experts: Optional[SharedExpertMLP] = None
 
+        # 路线 2 简化变体：MoELayer 在 2D 阶段给每个 expert 补齐到 m 的倍数，
+        # 这里记录 combine 阶段要切回的行数（None = 未启用）。
+        self.expert_pad_multiple: Optional[int] = None
+        self.expert_pad_padded_num_tokens: Optional[int] = None
+        self.original_hidden_shape: Optional[torch.Size] = None
+
         self.ep_group = model_comm_pgs.ep
         # use model_comm_pgs.expt_tp_group as tensor parallel group in this module.
         self.tp_group = model_comm_pgs.expt_tp
@@ -192,6 +198,25 @@ class MoETokenDispatcher:
         """Set shared expert to the dispatcher."""
         assert self.config.moe_shared_expert_overlap
         self.shared_experts = shared_experts
+
+    # ---- 路线 2 简化变体：2D 阶段的 expert m 对齐 padding 记账 ----------------
+    # 这里只存 3 个标量/形状，不需要 ExpertPadMeta 那么重 —— padding 与切片都由
+    # MoELayer 直接按 config 里的 pad_multiple 驱动。
+    def set_expert_pad_meta(self, pad_multiple, padded_num_tokens, original_hidden_shape):
+        """记录 MoELayer 在 2D 阶段做的 padding，供 combine_postprocess 切回。"""
+        self.expert_pad_multiple = pad_multiple
+        self.expert_pad_padded_num_tokens = padded_num_tokens
+        self.original_hidden_shape = original_hidden_shape
+
+    def clear_expert_pad_meta(self):
+        """丢弃上一轮前向的 padding 记账。
+
+        同一进程内切换 ``moe_router_expert_pad_multiple``（测试、精度探针）时必须调用，
+        否则过期记账会让 combine_postprocess 按上一轮的池子行数去切片。
+        """
+        self.expert_pad_multiple = None
+        self.expert_pad_padded_num_tokens = None
+        self.original_hidden_shape = None
 
 
 class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
@@ -1324,6 +1349,14 @@ class SDCMoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         if self.shared_experts is not None:
             shared_expert_output = self.shared_experts.get_output()
             output += shared_expert_output
+
+        if self.expert_pad_multiple is not None:
+            # 路线 2 简化变体：丢掉 2D 阶段追加的 dummy 行，切回原始 token 池。
+            # 纯切片，反向会给被丢掉的行自动补 0 梯度；dummy 行本来就梯度恒 0。
+            num_real = self.expert_pad_padded_num_tokens - (
+                self.expert_pad_multiple * self.num_experts
+            )
+            output = output[:num_real].reshape(self.original_hidden_shape)
         return output
 
     def _maybe_update_cuda_sync_point(self, point: str):

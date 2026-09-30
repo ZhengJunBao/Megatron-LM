@@ -472,6 +472,9 @@ class TransformerConfig(ModelParallelConfig):
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended."""
 
     moe_z_loss_coeff: Optional[float] = None  # 1e-3 would be a good start value for z-loss
+    # 路线 2 简化变体：在 MoE 层的 2D 阶段（[N, H]）给每个 expert 补齐到 m 的倍数，
+    # 新增 dummy 行（而不是就地翻转真实 token 的 0），combine 之后再切回 [N, H]。
+    moe_router_expert_pad_multiple: Optional[int] = None
     """Scaling coefficient for the z-loss. A starting value of 1e-3 is recommended."""
 
     moe_input_jitter_eps: Optional[float] = None
@@ -1118,6 +1121,43 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "Only transformer-engine>=1.11.0 supports FP8 grouped gemm, "
                     f"but your version is {get_te_version()}."
+                )
+
+        if self.moe_router_expert_pad_multiple is not None:
+            if self.moe_router_expert_pad_multiple <= 0:
+                raise ValueError(
+                    "moe_router_expert_pad_multiple must be a positive integer, "
+                    f"but got {self.moe_router_expert_pad_multiple}."
+                )
+
+            if self.moe_token_dispatcher_type != "alltoallsdc":
+                raise ValueError(
+                    "moe_router_expert_pad_multiple is only supported by the 'alltoallsdc' "
+                    f"token dispatcher, but got '{self.moe_token_dispatcher_type}'."
+                )
+
+            # 这条红线不能只靠注释守：padding 之后 routing map 多出 dummy 行，
+            # 会污染 router 内部按行统计/归一化的量，静默改变路由决策与训练动力学。
+            # 本变体不为其提供支持（用户 2026-09-30 明确），故直接拒绝组合。
+            if self.moe_router_enable_expert_bias:
+                raise ValueError(
+                    "moe_router_expert_pad_multiple is not supported together with "
+                    "moe_router_enable_expert_bias: the expert-bias counter "
+                    "(local_tokens_per_expert) would count the dummy rows."
+                )
+
+            if self.moe_z_loss_coeff is not None:
+                raise ValueError(
+                    "moe_router_expert_pad_multiple is not supported together with "
+                    "moe_z_loss_coeff: the z loss is attached to the logits, which have no "
+                    "rows for the appended dummy tokens."
+                )
+
+            if self.moe_router_padding_for_fp8:
+                raise ValueError(
+                    "moe_router_expert_pad_multiple is not supported together with "
+                    "moe_router_padding_for_fp8: the latter flips existing routing_map zeros "
+                    "in place, the former appends new dummy rows."
                 )
 
         if self.moe_router_padding_for_fp8:

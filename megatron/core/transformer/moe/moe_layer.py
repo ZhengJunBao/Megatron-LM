@@ -9,7 +9,11 @@ import torch
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe.moe_utils import get_default_model_comm_pgs
+from megatron.core.transformer.moe.moe_utils import (
+    get_default_model_comm_pgs,
+    pad_probs_and_tokens,
+    pad_routing_map_for_expert_multiple,
+)
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
@@ -180,6 +184,27 @@ class MoELayer(BaseMoELayer):
         """
         residual = hidden_states
         probs, routing_map = self.router(hidden_states)
+
+        pad_multiple = self.config.moe_router_expert_pad_multiple
+        if pad_multiple is not None:
+            # 路线 2 简化变体（只在 2D 阶段做，不能用在 3D 上）：
+            #   routing_map -> [N + R, E]  （R = E * m，每个 expert 一个 m 宽的预留块）
+            #   probs       -> [N + R, E]
+            #   hidden      -> [N + R, H]
+            # 真实 token 行逐位不变；dummy 行 hidden/probs 全 0。
+            #
+            # 位置很关键：必须在 ``self.router(...)`` **之后**。router 内部已经把
+            # aux loss / z loss / ``local_tokens_per_expert`` 都算完了，
+            # 提前 padding 会让它们看到 dummy 行，静默改变路由决策与训练动力学。
+            hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+            routing_map = pad_routing_map_for_expert_multiple(routing_map, pad_multiple)
+            probs, hidden_states = pad_probs_and_tokens(probs, hidden_states, pad_multiple)
+            self.token_dispatcher.set_expert_pad_meta(
+                pad_multiple, routing_map.shape[0], residual.shape
+            )
+        else:
+            self.token_dispatcher.clear_expert_pad_meta()
+
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )

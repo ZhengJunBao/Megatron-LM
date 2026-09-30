@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import math
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -489,6 +489,97 @@ def group_limited_topk(
     probs, top_indices = torch.topk(masked_scores, k=topk, dim=-1)
 
     return probs, top_indices
+
+
+def pad_routing_map_for_expert_multiple(
+    routing_map: torch.Tensor, pad_multiple: int
+) -> torch.Tensor:
+    """给每个 expert 追加 dummy 行，使其行数对齐到 pad_multiple 的倍数。
+
+    与 :func:`pad_routing_map`（就地翻转真实 token 的 0）不同，本函数**新增行**：
+    真实行逐位不变；预留区按每个 expert 一个 ``pad_multiple`` 宽的固定块排布，
+    专家 e 只占它自己的块，且仅前 ``d[e]`` 行在 e 列上置 1。
+
+    ``d[e] = (m - c[e] % m) % m``，特例 ``c[e] == 0`` 时补满 ``m`` 行。
+
+    只在 2D 阶段（``[N, E]``）使用；3D 的 ``[N, world, instances]`` 语义不同，不能用。
+
+    Args:
+        routing_map: [num_tokens, num_experts] 的 bool 路由图。
+        pad_multiple: 对齐倍数 m。
+
+    Returns:
+        [num_tokens + num_experts * pad_multiple, num_experts] 的 bool 路由图。
+    """
+    assert routing_map.dim() == 2, (
+        "pad_routing_map_for_expert_multiple 只能在 2D 的 [num_tokens, num_experts] 上使用，"
+        f"收到 {routing_map.dim()}D"
+    )
+    assert pad_multiple > 0, f"pad_multiple must be positive, got {pad_multiple}"
+    num_tokens, num_experts = routing_map.shape
+
+    counts = routing_map.sum(dim=0).long()
+    # torch 的 % 是 floored（Python 语义），故 (-c) % m 在 c % m == 0 时给 0。
+    num_to_pad = (-counts) % pad_multiple
+    num_to_pad = torch.where(
+        counts == 0,
+        torch.full_like(num_to_pad, pad_multiple),
+        num_to_pad,
+    )
+
+    padded = torch.zeros(
+        (num_tokens + pad_multiple * num_experts, num_experts),
+        dtype=routing_map.dtype,
+        device=routing_map.device,
+    )
+    padded[:num_tokens] = routing_map
+
+    # 预留区看成 [E, m] 的块：block[e, j] = True 表示专家 e 启用它的第 j 个槽位。
+    # 摊平后第 e*m+j 行正是专家 e 的第 j 个槽位，只需在第 e 列置 1。
+    slots = torch.arange(pad_multiple, device=routing_map.device)
+    block = slots.unsqueeze(0) < num_to_pad.unsqueeze(1)                       # [E, m]
+    eye = torch.eye(num_experts, dtype=torch.bool, device=routing_map.device)  # [E, E]
+    padded[num_tokens:] = (block.unsqueeze(-1) & eye.unsqueeze(1)).reshape(-1, num_experts)
+    return padded
+
+
+def pad_probs_and_tokens(
+    probs: torch.Tensor, hidden_states: torch.Tensor, pad_multiple: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """给 probs / hidden_states 末尾补 ``E * m`` 行全零，与 routing map 对齐。
+
+    补的行**必须是零**：dummy 行的 hidden 若非零，即使 prob 为 0 也会流过专家权重、
+    在反向把 ``act(垃圾) * 0`` 的 NaN 传播出去，污染整个 expert 的权重梯度。
+
+    只在 2D 阶段（``[N, E]`` / ``[N, H]``）使用。
+
+    Returns:
+        (padded_probs [N + E*m, E], padded_hidden [N + E*m, H])
+    """
+    assert probs.dim() == 2 and hidden_states.dim() == 2, (
+        "pad_probs_and_tokens 只能在 2D 的 [num_tokens, *] 上使用，"
+        f"收到 probs {probs.dim()}D / hidden {hidden_states.dim()}D"
+    )
+    assert probs.shape[0] == hidden_states.shape[0], (
+        f"probs 与 hidden 的 token 数不一致: {probs.shape[0]} vs {hidden_states.shape[0]}"
+    )
+    num_tokens, num_experts = probs.shape
+    num_dummy_rows = pad_multiple * num_experts
+    if num_dummy_rows == 0:
+        return probs, hidden_states
+
+    dummy_probs = torch.zeros(
+        (num_dummy_rows, num_experts), dtype=probs.dtype, device=probs.device
+    )
+    dummy_hidden = torch.zeros(
+        (num_dummy_rows, hidden_states.shape[1]),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+    return (
+        torch.cat([probs, dummy_probs], dim=0),
+        torch.cat([hidden_states, dummy_hidden], dim=0),
+    )
 
 
 def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tensor:
